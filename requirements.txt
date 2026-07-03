@@ -1,0 +1,7 @@
+openai-agents>=0.2.3
+mcp>=1.9
+httpx
+python-dotenv
+openinference-instrumentation-openai-agents>=0.1.11
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-http
