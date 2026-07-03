@@ -5,3 +5,4 @@ python-dotenv
 openinference-instrumentation-openai-agents>=0.1.11
 opentelemetry-sdk
 opentelemetry-exporter-otlp-proto-http
+chromadb>=0.5.0

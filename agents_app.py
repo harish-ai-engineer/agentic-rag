@@ -1,12 +1,12 @@
-"""Multi-agent RAG over R2R with MCP tools, handoffs, per-step cost, and
+"""Multi-agent RAG over ChromaDB with MCP tools, handoffs, per-step cost, and
 Langfuse observability.
 
 Architecture
 ------------
   Triage Agent ──handoff──> Research Agent ──handoff──> Analyst Agent
-       │                        │  MCP tools (r2r-retrieval server):
+       │                        │  MCP tools (chroma-retrieval server):
        │                        │    search_documents (+relevance filter)
-       │                        │    rag_answer, list_documents
+       │                        │    rag_answer, list_documents, sync_documents
        │                        └─ tool selection is LLM-driven
        └─ routes the user request to the right specialist
 
@@ -159,24 +159,161 @@ MODEL = os.getenv("AGENT_MODEL", "gpt-4o-mini")
 
 
 class StepHooks(RunHooks):
-    def __init__(self, tracker: CostTracker) -> None:
+    def __init__(self, tracker: CostTracker, user_question: str) -> None:
         self.tracker = tracker
+        self.user_question = user_question
         self.tool_spans: dict[str, list[object]] = {}
+        self.llm_spans: dict[str, list[object]] = {}
 
     @staticmethod
     def _tool_key(context, tool) -> str:
         call_id = str(getattr(context, "tool_call_id", "") or "")
         return call_id or getattr(tool, "name", "tool")
 
+    @staticmethod
+    def _safe_json(value: object, limit: int = 12000) -> str:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            text = str(value)
+        return text[:limit]
+
+    @staticmethod
+    def _set_current_span_io(
+        input_value: str | None = None,
+        output_value: str | None = None,
+        mime_type: str = "application/json",
+    ) -> None:
+        try:
+            from opentelemetry import trace
+            from openinference.semconv.trace import SpanAttributes
+
+            span = trace.get_current_span()
+            if input_value is not None:
+                span.set_attribute(SpanAttributes.INPUT_MIME_TYPE, mime_type)
+                span.set_attribute(SpanAttributes.INPUT_VALUE, input_value)
+            if output_value is not None:
+                span.set_attribute(SpanAttributes.OUTPUT_MIME_TYPE, mime_type)
+                span.set_attribute(SpanAttributes.OUTPUT_VALUE, output_value)
+        except Exception:
+            return
+
+    async def on_agent_start(self, context, agent) -> None:
+        payload = {
+            "agent": agent.name,
+            "user_question": self.user_question,
+            "turn_input": getattr(context, "turn_input", None),
+        }
+        input_value = self._safe_json(payload)
+        self._set_current_span_io(input_value=input_value)
+
+        tracer = globals().get("_otel_tracer")
+        if tracer is None:
+            return
+
+        from openinference.semconv.trace import (
+            OpenInferenceMimeTypeValues,
+            OpenInferenceSpanKindValues,
+            SpanAttributes,
+        )
+
+        with tracer.start_as_current_span(f"Agent input: {agent.name}") as span:
+            span.set_attribute(
+                SpanAttributes.OPENINFERENCE_SPAN_KIND,
+                OpenInferenceSpanKindValues.AGENT.value,
+            )
+            span.set_attribute(SpanAttributes.INPUT_MIME_TYPE,
+                               OpenInferenceMimeTypeValues.JSON.value)
+            span.set_attribute(SpanAttributes.INPUT_VALUE, input_value)
+
+    async def on_agent_end(self, context, agent, output) -> None:
+        output_value = str(output)[:12000]
+        self._set_current_span_io(output_value=output_value, mime_type="text/plain")
+
+        tracer = globals().get("_otel_tracer")
+        if tracer is None:
+            return
+
+        from openinference.semconv.trace import (
+            OpenInferenceMimeTypeValues,
+            OpenInferenceSpanKindValues,
+            SpanAttributes,
+        )
+
+        with tracer.start_as_current_span(f"Agent output: {agent.name}") as span:
+            span.set_attribute(
+                SpanAttributes.OPENINFERENCE_SPAN_KIND,
+                OpenInferenceSpanKindValues.AGENT.value,
+            )
+            span.set_attribute(SpanAttributes.OUTPUT_MIME_TYPE,
+                               OpenInferenceMimeTypeValues.TEXT.value)
+            span.set_attribute(SpanAttributes.OUTPUT_VALUE, output_value)
+
+    async def on_llm_start(
+        self, context, agent, system_prompt, input_items
+    ) -> None:
+        payload = {
+            "agent": agent.name,
+            "user_question": self.user_question,
+            "system_prompt": system_prompt,
+            "input_items": input_items,
+        }
+        input_value = self._safe_json(payload)
+        self._set_current_span_io(input_value=input_value)
+
+        tracer = globals().get("_otel_tracer")
+        if tracer is None:
+            return
+
+        from openinference.semconv.trace import (
+            OpenInferenceMimeTypeValues,
+            OpenInferenceSpanKindValues,
+            SpanAttributes,
+        )
+
+        span = tracer.start_span(f"Agent turn input: {agent.name}")
+        span.set_attribute(
+            SpanAttributes.OPENINFERENCE_SPAN_KIND,
+            OpenInferenceSpanKindValues.LLM.value,
+        )
+        span.set_attribute(SpanAttributes.INPUT_MIME_TYPE,
+                           OpenInferenceMimeTypeValues.JSON.value)
+        span.set_attribute(SpanAttributes.INPUT_VALUE, input_value)
+        self.llm_spans.setdefault(agent.name, []).append(span)
+
     async def on_llm_end(self, context, agent, response) -> None:
         model = getattr(agent, "model", None) or MODEL
         usage = getattr(response, "usage", None)
         if usage is not None:
             self.tracker.add_llm(agent.name, str(model), usage)
+        output_value = self._safe_json(getattr(response, "output", response))
+        self._set_current_span_io(output_value=output_value)
+
+        spans = self.llm_spans.get(agent.name, [])
+        span = spans.pop() if spans else None
+        if not spans:
+            self.llm_spans.pop(agent.name, None)
+        if span is None:
+            return
+
+        from openinference.semconv.trace import (
+            OpenInferenceMimeTypeValues,
+            SpanAttributes,
+        )
+
+        span.set_attribute(SpanAttributes.OUTPUT_MIME_TYPE,
+                           OpenInferenceMimeTypeValues.JSON.value)
+        span.set_attribute(SpanAttributes.OUTPUT_VALUE, output_value)
+        span.end()
 
     async def on_tool_start(self, context, agent, tool) -> None:
         self.tracker.add_event("tool", agent.name, tool.name)
-        if tool.name not in {"search_documents", "rag_answer", "list_documents"}:
+        if tool.name not in {
+            "search_documents",
+            "rag_answer",
+            "list_documents",
+            "sync_documents",
+        }:
             return
 
         tracer = globals().get("_otel_tracer")
@@ -190,7 +327,7 @@ class StepHooks(RunHooks):
         )
 
         tool_args = getattr(context, "tool_arguments", None)
-        span = tracer.start_span(f"Vector DB: R2R pgvector / {tool.name}")
+        span = tracer.start_span(f"Vector DB: ChromaDB / {tool.name}")
         span.set_attribute(
             SpanAttributes.OPENINFERENCE_SPAN_KIND,
             OpenInferenceSpanKindValues.RETRIEVER.value,
@@ -204,10 +341,14 @@ class StepHooks(RunHooks):
                     "agent": agent.name,
                     "tool": tool.name,
                     "arguments": tool_args,
-                    "r2r_base_url": os.getenv("R2R_BASE_URL",
-                                              "http://localhost:7272"),
-                    "database": "PostgreSQL + pgvector",
-                    "storage": "R2R document chunks and embeddings",
+                    "chroma_db_dir": os.getenv(
+                        "CHROMA_DB_DIR", str(PROJECT_DIR / "chroma_db")
+                    ),
+                    "chroma_collection": os.getenv(
+                        "CHROMA_COLLECTION", "agentic_rag_docs"
+                    ),
+                    "database": "ChromaDB",
+                    "storage": "Local ChromaDB persistent collection",
                 },
                 ensure_ascii=True,
             ),
@@ -217,6 +358,16 @@ class StepHooks(RunHooks):
     async def on_handoff(self, context, from_agent, to_agent) -> None:
         self.tracker.add_event(
             "handoff", from_agent.name, f"-> {to_agent.name}"
+        )
+        self._set_current_span_io(
+            input_value=self._safe_json(
+                {
+                    "from_agent": from_agent.name,
+                    "to_agent": to_agent.name,
+                    "user_question": self.user_question,
+                    "turn_input": getattr(context, "turn_input", None),
+                }
+            )
         )
 
     async def on_tool_end(self, context, agent, tool, result: object) -> None:
@@ -238,16 +389,22 @@ class StepHooks(RunHooks):
         span.set_attribute(SpanAttributes.OUTPUT_MIME_TYPE,
                            OpenInferenceMimeTypeValues.TEXT.value)
         span.set_attribute(SpanAttributes.OUTPUT_VALUE, output[:12000])
-        span.set_attribute("r2r.result_preview", output[:1200])
+        span.set_attribute("chroma.result_preview", output[:1200])
         span.end()
 
     def close_open_tool_spans(self) -> None:
         for spans in self.tool_spans.values():
             while spans:
                 span = spans.pop()
-                span.set_attribute("r2r.warning", "tool output was not captured")
+                span.set_attribute("chroma.warning", "tool output was not captured")
                 span.end()
         self.tool_spans.clear()
+        for spans in self.llm_spans.values():
+            while spans:
+                span = spans.pop()
+                span.set_attribute("agent.warning", "LLM output was not captured")
+                span.end()
+        self.llm_spans.clear()
 
 
 @function_tool
@@ -268,7 +425,7 @@ def word_count(text: str) -> str:
     return str(len(text.split()))
 
 
-def build_agents(r2r_mcp: MCPServerStdio):
+def build_agents(chroma_mcp: MCPServerStdio):
     analyst = Agent(
         name="Analyst",
         model=MODEL,
@@ -286,15 +443,15 @@ def build_agents(r2r_mcp: MCPServerStdio):
         name="Research",
         model=MODEL,
         instructions=(
-            "You are the Research agent for an R2R knowledge base. "
+            "You are the Research agent for a ChromaDB knowledge base. "
             "Pick tools deliberately: list_documents to see what exists; "
             "search_documents for raw evidence chunks with relevance scores "
             "(cite them, ignore results below 0.2 relevance); rag_answer "
             "for a direct citation-backed answer. Gather evidence, then "
-            "hand off to the Analyst with a bullet summary of findings "
-            "including relevance scores."
+            "always hand off to the Analyst with a bullet summary of findings "
+            "including relevance scores. Do not write the final answer yourself."
         ),
-        mcp_servers=[r2r_mcp],
+        mcp_servers=[chroma_mcp],
         handoffs=[analyst],
     )
 
@@ -329,20 +486,36 @@ async def main() -> None:
     print(f"Question: {question}\n")
 
     tracker = CostTracker()
-    hooks = StepHooks(tracker)
-    r2r_mcp = MCPServerStdio(
-        name="r2r-retrieval",
+    hooks = StepHooks(tracker, question)
+    chroma_mcp = MCPServerStdio(
+        name="chroma-retrieval",
         params={
             "command": sys.executable,
-            "args": [str(PROJECT_DIR / "mcp_server.py")],
-            "env": {"R2R_BASE_URL": os.getenv("R2R_BASE_URL",
-                                              "http://localhost:7272")},
+            "args": [str(PROJECT_DIR / "chroma_mcp_server.py")],
+            "env": {
+                "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", ""),
+                "R2R_BASE_URL": os.getenv(
+                    "R2R_BASE_URL", "http://localhost:7272"
+                ),
+                "CHROMA_DB_DIR": os.getenv(
+                    "CHROMA_DB_DIR", str(PROJECT_DIR / "chroma_db")
+                ),
+                "CHROMA_COLLECTION": os.getenv(
+                    "CHROMA_COLLECTION", "agentic_rag_docs"
+                ),
+                "CHROMA_AUTO_SYNC": os.getenv("CHROMA_AUTO_SYNC", "true"),
+                "EMBEDDING_MODEL": os.getenv(
+                    "EMBEDDING_MODEL", "text-embedding-3-small"
+                ),
+                "RAG_MODEL": os.getenv("RAG_MODEL", MODEL),
+                "AGENT_MODEL": MODEL,
+            },
         },
         client_session_timeout_seconds=180,
     )
 
-    async with r2r_mcp:
-        triage = build_agents(r2r_mcp)
+    async with chroma_mcp:
+        triage = build_agents(chroma_mcp)
         tracer = globals().get("_otel_tracer")
         if tracer is None:
             result = await Runner.run(
@@ -363,12 +536,14 @@ async def main() -> None:
                 span.set_attribute(SpanAttributes.INPUT_MIME_TYPE,
                                    OpenInferenceMimeTypeValues.TEXT.value)
                 span.set_attribute(SpanAttributes.INPUT_VALUE, question)
-                span.set_attribute("rag.vector_database",
-                                   "PostgreSQL + pgvector")
-                span.set_attribute("rag.r2r_base_url", os.getenv(
-                    "R2R_BASE_URL", "http://localhost:7272"
+                span.set_attribute("rag.vector_database", "ChromaDB")
+                span.set_attribute("rag.chroma_db_dir", os.getenv(
+                    "CHROMA_DB_DIR", str(PROJECT_DIR / "chroma_db")
                 ))
-                span.set_attribute("rag.mcp_server", "mcp_server.py")
+                span.set_attribute("rag.chroma_collection", os.getenv(
+                    "CHROMA_COLLECTION", "agentic_rag_docs"
+                ))
+                span.set_attribute("rag.mcp_server", "chroma_mcp_server.py")
                 result = await Runner.run(
                     triage, question, hooks=hooks, max_turns=20
                 )
