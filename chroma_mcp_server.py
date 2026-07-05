@@ -29,6 +29,7 @@ RAG_MODEL = os.getenv("RAG_MODEL", os.getenv("AGENT_MODEL", "gpt-4o-mini"))
 
 mcp = FastMCP("chroma-retrieval")
 openai_client = OpenAI()
+
 chroma_client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
 collection = chroma_client.get_or_create_collection(
     name=CHROMA_COLLECTION,
